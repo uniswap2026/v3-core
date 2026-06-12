@@ -1,30 +1,79 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 pragma solidity >=0.5.0 <0.8.0;
 
-/// @title Math library for computing sqrt prices from ticks and vice versa
-/// @notice Computes sqrt price for ticks of size 1.0001, i.e. sqrt(1.0001^tick) as fixed point Q64.96 numbers. Supports
-/// prices between 2**-128 and 2**128
+/// @title Tick 数学库
+/// @notice 计算 tick 对应的 sqrt 价格（sqrt(1.0001^tick)）以及反向计算
+/// @dev 以 Q64.96 格式的定点数表示，支持 2^-128 到 2^128 之间的价格
+///
+/// 核心概念：
+/// - Tick 是价格的离散化表示，每个 tick 代表 sqrt(1.0001) 的倍数
+/// - sqrt(price) = sqrt(1.0001^tick) = 1.0001^(tick/2)
+/// - 使用 Q64.96 格式存储：实际值 = 存储值 / 2^96
+///
+/// 为什么使用 sqrt(price) 而非 price？
+/// - 在 AMM 计算中，使用 sqrt(price) 可以简化数学运算
+/// - 流动性计算：amount = liquidity * (sqrt(upper) - sqrt(lower))
+///
+/// 价格范围：
+/// - 最小 tick：-887272（对应价格 2^-128 ≈ 10^-39）
+/// - 最大 tick：887272（对应价格 2^128 ≈ 10^38）
+/// - 覆盖所有合理的代币价格范围
 library TickMath {
-    /// @dev The minimum tick that may be passed to #getSqrtRatioAtTick computed from log base 1.0001 of 2**-128
+    /// @notice 最小 tick 值
+    /// @dev 由 log base 1.0001 of 2^-128 计算得出
+    /// 这是 #getSqrtRatioAtTick 可以接受的最小输入
     int24 internal constant MIN_TICK = -887272;
-    /// @dev The maximum tick that may be passed to #getSqrtRatioAtTick computed from log base 1.0001 of 2**128
+
+    /// @notice 最大 tick 值
+    /// @dev 由 log base 1.0001 of 2^128 计算得出
+    /// 等于 -MIN_TICK
     int24 internal constant MAX_TICK = -MIN_TICK;
 
-    /// @dev The minimum value that can be returned from #getSqrtRatioAtTick. Equivalent to getSqrtRatioAtTick(MIN_TICK)
+    /// @notice #getSqrtRatioAtTick 可以返回的最小值
+    /// @dev 等于 getSqrtRatioAtTick(MIN_TICK)
+    /// 十六进制：0x00000000000000000100010000
     uint160 internal constant MIN_SQRT_RATIO = 4295128739;
-    /// @dev The maximum value that can be returned from #getSqrtRatioAtTick. Equivalent to getSqrtRatioAtTick(MAX_TICK)
+
+    /// @notice #getSqrtRatioAtTick 可以返回的最大值
+    /// @dev 等于 getSqrtRatioAtTick(MAX_TICK)
+    /// 十六进制：0xffff000000000000000000000000
     uint160 internal constant MAX_SQRT_RATIO = 1461446703485210103287273052203988822378723970342;
 
-    /// @notice Calculates sqrt(1.0001^tick) * 2^96
-    /// @dev Throws if |tick| > max tick
-    /// @param tick The input tick for the above formula
-    /// @return sqrtPriceX96 A Fixed point Q64.96 number representing the sqrt of the ratio of the two assets (token1/token0)
-    /// at the given tick
+    /// @notice 计算 sqrt(1.0001^tick) * 2^96
+    /// @dev 如果 |tick| > max tick 将 revert
+    ///
+    /// 算法概述：
+    /// 1. 使用二分查找思想，将 tick 的二进制表示分解为多个位的和
+    /// 2. 对于每个位，预先计算 sqrt(1.0001^(2^i)) 的值
+    /// 3. 根据 tick 的二进制位，将对应的预计算值相乘
+    /// 4. 如果 tick 为负数，取倒数
+    /// 5. 从 Q128.128 转换到 Q64.96（右移 32 位）
+    ///
+    /// 预计算常量说明：
+    /// - 0xfffcb933bd6fad37aa2d162d1a594001 ≈ sqrt(1.0001^1) * 2^128
+    /// - 0xfff97272373d413259a46990580e213a ≈ sqrt(1.0001^2) * 2^128
+    /// - ... 依此类推，每个常量代表 2^i 的 sqrt ratio
+    ///
+    /// 为什么使用 Q128.128 中间格式？
+    /// - 乘法需要足够的精度来避免舍入误差
+    /// - 最终转换到 Q64.96 时，右移 32 位并向上取整
+    ///
+    /// @param tick 输入 tick（-887272 到 887272）
+    /// @return sqrtPriceX96 Q64.96 格式的 sqrt 价格
     function getSqrtRatioAtTick(int24 tick) internal pure returns (uint160 sqrtPriceX96) {
+        // 计算 tick 的绝对值
         uint256 absTick = tick < 0 ? uint256(-int256(tick)) : uint256(int256(tick));
         require(absTick <= uint256(MAX_TICK), 'T');
 
-        uint256 ratio = absTick & 0x1 != 0 ? 0xfffcb933bd6fad37aa2d162d1a594001 : 0x100000000000000000000000000000000;
+        // 根据 tick 的最低位选择初始值
+        // 如果 tick 是奇数，使用 sqrt(1.0001^1)；否则使用 1.0
+        uint256 ratio = absTick & 0x1 != 0
+            ? 0xfffcb933bd6fad37aa2d162d1a594001
+            : 0x100000000000000000000000000000000;
+
+        // 根据 tick 的每个二进制位，累乘对应的预计算值
+        // 每个位对应一个预计算的 sqrt(1.0001^(2^i)) 常量
+        // 使用 >> 128 是因为中间结果使用 Q128.128 格式
         if (absTick & 0x2 != 0) ratio = (ratio * 0xfff97272373d413259a46990580e213a) >> 128;
         if (absTick & 0x4 != 0) ratio = (ratio * 0xfff2e50f5f656932ef12357cf3c7fdcc) >> 128;
         if (absTick & 0x8 != 0) ratio = (ratio * 0xffe5caca7e10e4e61c3624eaa0941cd0) >> 128;
@@ -45,27 +94,54 @@ library TickMath {
         if (absTick & 0x40000 != 0) ratio = (ratio * 0x2216e584f5fa1ea926041bedfe98) >> 128;
         if (absTick & 0x80000 != 0) ratio = (ratio * 0x48a170391f7dc42444e8fa2) >> 128;
 
+        // 如果 tick 为正数，需要取倒数
+        // 使用 type(uint256).max / ratio 近似倒数
         if (tick > 0) ratio = type(uint256).max / ratio;
 
-        // this divides by 1<<32 rounding up to go from a Q128.128 to a Q128.96.
-        // we then downcast because we know the result always fits within 160 bits due to our tick input constraint
-        // we round up in the division so getTickAtSqrtRatio of the output price is always consistent
+        // 从 Q128.128 转换到 Q128.96
+        // 除以 1<<32（右移 32 位），向上取整
+        // 由于 tick 输入限制，结果始终适应 160 位
+        // 向上取整确保 getTickAtSqrtRatio 的一致性
         sqrtPriceX96 = uint160((ratio >> 32) + (ratio % (1 << 32) == 0 ? 0 : 1));
     }
 
-    /// @notice Calculates the greatest tick value such that getRatioAtTick(tick) <= ratio
-    /// @dev Throws in case sqrtPriceX96 < MIN_SQRT_RATIO, as MIN_SQRT_RATIO is the lowest value getRatioAtTick may
-    /// ever return.
-    /// @param sqrtPriceX96 The sqrt ratio for which to compute the tick as a Q64.96
-    /// @return tick The greatest tick for which the ratio is less than or equal to the input ratio
+    /// @notice 计算满足 getSqrtRatioAtTick(tick) <= ratio 的最大 tick
+    /// @dev 如果 sqrtPriceX96 < MIN_SQRT_RATIO 将 revert
+    /// 因为 MIN_SQRT_RATIO 是 #getSqrtRatioAtTick 可以返回的最小值
+    ///
+    /// 算法概述：
+    /// 1. 计算 ratio 的整数对数（以 2 为底）
+    ///    - 使用二分查找法找到最高有效位（MSB）
+    ///    - 通过内联汇编优化，每个比较使用不同的位移
+    /// 2. 将 ratio 归一化到 [2^127, 2^128) 范围
+    /// 3. 计算 log2(ratio) 的小数部分（64 位精度）
+    ///    - 使用平方根迭代法：r = r^2 / 2^127
+    ///    - 每次迭代获得 1 位小数
+    /// 4. 将 log2(ratio) 转换为 log_{1.0001}(ratio)
+    /// 5. 通过查找表确定最终 tick（处理舍入误差）
+    ///
+    /// 对数计算原理：
+    /// - log2(sqrt(1.0001^tick)) = tick/2 * log2(1.0001)
+    /// - tick = 2 * log2(ratio) / log2(1.0001)
+    /// - log2(1.0001) ≈ 0.00014426950408889634
+    /// - 1 / (2 * log2(1.0001)) ≈ 3453103856372597772579024 (128.128 格式)
+    ///
+    /// @param sqrtPriceX96 Q64.96 格式的 sqrt 价格
+    /// @return tick 满足 ratio >= getSqrtRatioAtTick(tick) 的最大 tick
     function getTickAtSqrtRatio(uint160 sqrtPriceX96) internal pure returns (int24 tick) {
-        // second inequality must be < because the price can never reach the price at the max tick
+        // 第二个不等式必须是 < 因为价格永远无法达到最大 tick 处的价格
         require(sqrtPriceX96 >= MIN_SQRT_RATIO && sqrtPriceX96 < MAX_SQRT_RATIO, 'R');
+
+        // 将 Q64.96 转换到 Q128.32 格式（左移 32 位）
         uint256 ratio = uint256(sqrtPriceX96) << 32;
 
+        // 计算 ratio 的最高有效位（MSB）
         uint256 r = ratio;
         uint256 msb = 0;
 
+        // 二分查找法计算 MSB
+        // 从 128 位开始，逐步缩小到 1 位
+        // 每次迭代将范围减半，最终得到 MSB 的位置
         assembly {
             let f := shl(7, gt(r, 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF))
             msb := or(msb, f)
@@ -106,11 +182,19 @@ library TickMath {
             msb := or(msb, f)
         }
 
+        // 将 r 归一化到 [2^127, 2^128) 范围
         if (msb >= 128) r = ratio >> (msb - 127);
         else r = ratio << (127 - msb);
 
+        // 计算 log2(ratio) 的整数部分（64.64 格式）
         int256 log_2 = (int256(msb) - 128) << 64;
 
+        // 计算 log2(ratio) 的小数部分（64 位精度）
+        // 使用平方根迭代法：
+        // - r = r^2 / 2^127
+        // - 如果 r >= 2^128，说明小数位为 1
+        // - 每次迭代获得 1 位小数
+        // 从 63 位到 50 位，共 14 位迭代
         assembly {
             r := shr(127, mul(r, r))
             let f := shr(128, r)
@@ -195,11 +279,23 @@ library TickMath {
             log_2 := or(log_2, shl(50, f))
         }
 
-        int256 log_sqrt10001 = log_2 * 255738958999603826347141; // 128.128 number
+        // 将 log2(ratio) 转换为 log_{1.0001}(ratio)
+        // 常量 255738958999603826347141 ≈ 1 / (2 * log2(sqrt(1.0001))) （128.128 格式）
+        int256 log_sqrt10001 = log_2 * 255738958999603826347141;
 
-        int24 tickLow = int24((log_sqrt10001 - 3402992956809132418596140100660247210) >> 128);
-        int24 tickHi = int24((log_sqrt10001 + 291339464771989622907027621153398088495) >> 128);
+        // 计算 tick 的上下界
+        // 常量用于修正计算中的偏移
+        int24 tickLow = int24(
+            (log_sqrt10001 - 3402992956809132418596140100660247210) >> 128
+        );
+        int24 tickHi = int24(
+            (log_sqrt10001 + 291339464771989622907027621153398088495) >> 128
+        );
 
+        // 通过比较确定最终 tick
+        // 如果上下界相同，直接返回
+        // 否则检查 tickHi 对应的价格，如果小于等于输入价格，返回 tickHi
+        // 否则返回 tickLow
         tick = tickLow == tickHi ? tickLow : getSqrtRatioAtTick(tickHi) <= sqrtPriceX96 ? tickHi : tickLow;
     }
 }
